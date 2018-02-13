@@ -1,26 +1,71 @@
 package fr.nic0w.trading.gdax;
 
+import static joptsimple.util.DateConverter.datePattern;
+import static joptsimple.util.RegexMatcher.regex;
+
 import java.io.File;
 import java.io.IOException;
 import java.net.URL;
+import java.nio.file.Path;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 import java.util.Calendar;
+import java.util.Date;
+import java.util.Optional;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 
-public class HistoryDownloader {
+import joptsimple.OptionException;
+import joptsimple.OptionParser;
+import joptsimple.OptionSet;
+import joptsimple.OptionSpec;
+import joptsimple.util.PathConverter;
+import joptsimple.util.PathProperties;
 
-  private static final int PERIOD = 300;
+public class HistoryDownloader implements Runnable {
   
+  private final static String ISO8601_DATE_FORMAT = "yyyy-MM-dd'T'HH:mmX";
+
+  private final static String GDAX_CANDLES_URL_FORMAT = "https://api.gdax.com/products/%s/candles?granularity=%d";
+
+  private final ObjectMapper jsonMapper;
+  
+  private final Granularity granularity;
+
+  private final String product;
+  
+  private Instant start, end;
+  
+  public HistoryDownloader(String product, Granularity granularity) {
+    
+    this.jsonMapper = new ObjectMapper();
+    
+    this.product = product;
+    this.granularity = granularity;
+    
+  }
+  
+  public HistoryDownloader(String product, Granularity granularity, Instant start) {
+    
+    this(product, granularity);
+    
+    this.start = start;
+  }
+   
+  public HistoryDownloader(String product, Granularity granularity, Instant start, Instant end) {
+    
+    this(product, granularity, start);
+    
+    this.end = end;
+  }
   
   public static String toISO8601(Instant i) {
     
-    return DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mmX")
+    return DateTimeFormatter.ofPattern(ISO8601_DATE_FORMAT)
                 .withZone(ZoneOffset.UTC)
                 .format(i);
     
@@ -28,34 +73,103 @@ public class HistoryDownloader {
   
   public static void main(String[] args) throws IOException, InterruptedException {
     
-    ObjectMapper jsonMapper = new ObjectMapper();
+    OptionParser parser = new OptionParser();
 
-    Calendar calendar = Calendar.getInstance();
+    OptionSpec<String> productOption = parser.accepts("product", "Product. Ex: BTC-USD, ETH-EUR, ...").
+        withRequiredArg().
+        withValuesConvertedBy(regex("[A-Z]{3}-[A-Z]{3}")).required();
     
-    calendar.set(2017, 10, 01, 12, 00);
+    OptionSpec<Granularity> granularityOption = parser.accepts("granularity", "Period of the candles.").
+        withRequiredArg().
+        ofType(Granularity.class).
+        defaultsTo(Granularity.values()).
+        required();
     
-    Instant stopDate = calendar.getTime().toInstant();
+    OptionSpec<Date> startOption = parser.accepts("start", "From when to download historical data.").
+        withRequiredArg().
+        withValuesConvertedBy(datePattern(ISO8601_DATE_FORMAT));
     
-    String simpleDataUrlFormat= "https://api.gdax.com/products/ETH-EUR/candles?granularity=%d";
+    OptionSpec<Date> endOption = parser.accepts("end", "Until when to download historical data.").
+        withRequiredArg().
+        withValuesConvertedBy(datePattern(ISO8601_DATE_FORMAT));
     
-    Instant end = null, start=null;
+    OptionSpec<Path> outputFileOption = parser.accepts("output", "Output file").
+        withRequiredArg().
+        withValuesConvertedBy(new PathConverter(PathProperties.WRITABLE));
+    
+    OptionSet parsedOptions = null;   
+    try {
+      
+      parsedOptions = parser.parse(args);
+      
+    } catch (OptionException e) {
+      
+      
+      parser.printHelpOn(System.out);
+      
+      System.exit(-1);
+    }
+    
+    String product = parsedOptions.valueOf(productOption);
+    
+    Granularity granularity = parsedOptions.valueOf(granularityOption);
+    
+    Optional<Date> startDate = parsedOptions.valueOfOptional(startOption);
+    
+    Optional<Date> endDate = parsedOptions.valueOfOptional(endOption);
+
+    
+    HistoryDownloader downloader;
+    
+    if(startDate.isPresent() && endDate.isPresent()) {
+      
+      downloader = new HistoryDownloader(product, granularity, startDate.get().toInstant(), endDate.get().toInstant());
+    }
+    else if(startDate.isPresent()) {
+      
+      downloader = new HistoryDownloader(product, granularity, startDate.get().toInstant());      
+    }
+    else {
+      
+      downloader = new HistoryDownloader(product, granularity);      
+    }
+    
+    downloader.run();
+  }
+
+
+  @Override
+  public void run() {
     
     ArrayNode array = jsonMapper.createArrayNode();
     
-    while(true) {
+    String baseURL = String.format(GDAX_CANDLES_URL_FORMAT, this.product, this.granularity.getCandlePeriod()); 
+    
+    Instant stop = start == null ? Instant.now() : start;
+    
+    do {
       
-      String currentUrl = String.format(simpleDataUrlFormat, PERIOD);
+      String currentURL = baseURL;
       
       if(end != null && start != null) {
         
-        currentUrl += "&start=" + toISO8601(start);
-        currentUrl += "&end=" + toISO8601(end);
-        
+        currentURL += "&start=" + toISO8601(start);
+        currentURL += "&end=" + toISO8601(end);
       }
       
-      System.out.println(currentUrl);
+      System.out.println("Requesting: " + currentURL);
+
+      JsonNode data;
       
-      JsonNode data = jsonMapper.readTree(new URL(currentUrl));
+      try {
+        data = jsonMapper.readTree(new URL(currentURL));
+        
+      } catch (IOException e) {
+        
+        System.err.println("I/O exception while fetching data from GDAX: " + e.getMessage());
+        
+        break;
+      }
       
       System.out.println("Got " + data.size() + " candles.");
       
@@ -69,27 +183,32 @@ public class HistoryDownloader {
       else {
         
         end = start;
-        
       }
-      
-      start = end.minus(PERIOD * 350, ChronoUnit.SECONDS);
 
+      start = end.minus(this.granularity.getCandlePeriod() * 350, ChronoUnit.SECONDS);
       
       array.addAll((ArrayNode) data); 
       
-      if(end.isBefore(stopDate))
-        break;
-      
-      Thread.sleep(500);
-      
+      try {
+        Thread.sleep(500);
+        
+      } catch (InterruptedException e) {
+     
+        System.err.println("Stopping: " + e.getMessage());
+      }      
+    }
+    while(stop.isBefore(start));
+    
+    File out = new File(String.format("dataset_%s_%d_%d-%d.json", this.product, this.granularity.getCandlePeriod(), this.start.toEpochMilli(), this.end.toEpochMilli()));
+    
+    try {
+      jsonMapper.writeValue(out, array);
+    } catch (IOException e) {
+
+      System.err.println("I/O exception while writing data to disk: " + e.getMessage());
     }
     
-    File out = new File("dataset.json");
-    
-    
-    jsonMapper.writeValue(out, array);
-    
-    System.out.println("Done !");
+    System.out.println("Done !");    
   }
 
 }
